@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import logging
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -14,6 +15,9 @@ except Exception:  # pragma: no cover - tqdmなしでも動作可能
         return iterable
 
 
+logger = logging.getLogger(__name__)
+
+
 CONFIG = {
     "USERNAME": "jack",
     "INSTANCE": "https://nitter.net",
@@ -24,6 +28,18 @@ CONFIG = {
     "TIMEOUT": 30,
     "LOG_FILENAME": "download_log.json",
 }
+
+
+def setup_logger(dest_dir: str) -> None:
+    log_file = os.path.join(dest_dir, "error.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
+    )
 
 
 def init_log(log_path: str) -> dict:
@@ -49,14 +65,21 @@ def fetch_page(session: requests.Session, username: str, page: int) -> str:
         url = f"{base}/{username}"
     else:
         url = f"{base}/{username}?page={page}"
-    for _ in range(3):
+    for attempt in range(3):
         try:
             res = session.get(url, timeout=CONFIG["TIMEOUT"])
             if res.status_code == 200:
                 return res.text
-        except requests.RequestException:
-            pass
+            logger.warning(
+                "Failed to fetch %s (status %s) [attempt %s]",
+                url,
+                res.status_code,
+                attempt + 1,
+            )
+        except requests.RequestException as e:
+            logger.error("Error fetching %s: %s", url, e)
         time.sleep(CONFIG["PAGE_DELAY"])
+    logger.error("Giving up fetching %s after 3 attempts", url)
     return ""
 
 
@@ -91,7 +114,7 @@ def guess_filename(url: str, content_type: str) -> str:
 def download_image(session: requests.Session, url: str, dest_dir: str, log: dict) -> None:
     if url in log["downloaded"]:
         return
-    for _ in range(3):
+    for attempt in range(3):
         try:
             res = session.get(url, timeout=CONFIG["TIMEOUT"], stream=True)
             if res.status_code == 200 and res.headers.get("Content-Type", "").startswith("image"):
@@ -103,23 +126,33 @@ def download_image(session: requests.Session, url: str, dest_dir: str, log: dict
                 log["downloaded"][url] = filename
                 save_log(os.path.join(dest_dir, CONFIG["LOG_FILENAME"]), log)
                 return
-        except requests.RequestException:
-            pass
+            logger.warning(
+                "Invalid response for %s (status %s, content-type %s) [attempt %s]",
+                url,
+                res.status_code,
+                res.headers.get("Content-Type"),
+                attempt + 1,
+            )
+        except requests.RequestException as e:
+            logger.error("Error downloading %s: %s", url, e)
         time.sleep(CONFIG["DL_DELAY"])
     log["errors"][url] = log["errors"].get(url, 0) + 1
     save_log(os.path.join(dest_dir, CONFIG["LOG_FILENAME"]), log)
+    logger.error("Failed to download %s after 3 attempts", url)
 
 
 def main() -> None:
     session = requests.Session()
     user_dir = os.path.join(CONFIG["OUT_DIR"], CONFIG["USERNAME"])
     os.makedirs(user_dir, exist_ok=True)
+    setup_logger(user_dir)
     log_path = os.path.join(user_dir, CONFIG["LOG_FILENAME"])
     log = init_log(log_path)
 
     for page in range(1, CONFIG["MAX_PAGES"] + 1):
         html = fetch_page(session, CONFIG["USERNAME"], page)
         if not html:
+            logger.error("No HTML fetched for page %s; stopping.", page)
             break
         urls = extract_image_urls(html)
         for url in tqdm(urls, desc=f"page {page}"):
@@ -128,4 +161,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:  # pragma: no cover - エラー原因記録のため
+        logger.exception("Unhandled exception occurred")
+        raise
